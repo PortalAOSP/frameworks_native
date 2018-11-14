@@ -63,7 +63,7 @@ BufferLayer::BufferLayer(SurfaceFlinger* flinger, const sp<Client>& client, cons
         mRefreshPending(false) {
     ALOGV("Creating Layer %s", name.string());
 
-    mFlinger->getRenderEngine().genTextures(1, &mTextureName);
+    mTextureName = mFlinger->getNewTexture();
     mTexture.init(Texture::TEXTURE_EXTERNAL, mTextureName);
 
     if (flags & ISurfaceComposerClient::eNonPremultiplied) mPremultipliedAlpha = false;
@@ -631,7 +631,40 @@ void BufferLayer::setPerFrameData(const sp<const DisplayDevice>& displayDevice) 
         visible.dump(LOG_TAG);
     }
 
-    error = hwcLayer->setSurfaceDamage(surfaceDamageRegion);
+    if(mFlinger->mDamageUsesScreenReference) {
+       const Rect& frame = hwcInfo.displayFrame;
+       int32_t left = frame.left;
+       int32_t top = frame.top;
+       int32_t right = frame.right;
+       int32_t bottom = frame.bottom;
+       if(surfaceDamageRegion.getBounds() == Rect::INVALID_RECT) {
+          auto fullSource = Region(Rect(left, top, right, bottom));
+          error = hwcLayer->setSurfaceDamage(fullSource);
+       } else {
+          //There is no easy way to scale, so just scale the bounds
+          const Rect& preDamageRect = surfaceDamageRegion.bounds();
+          const FloatRect& crop = hwcInfo.sourceCrop;
+
+          float frameWidth = right - left;
+          float frameHeight = bottom - top;
+
+          float cropWidth = crop.right - crop.left;
+          float cropHeight = crop.bottom - crop.top;
+
+          float wFactor = frameWidth / cropWidth;
+          float hFactor = frameHeight / cropHeight;
+
+          Rect scaledDamageRect = Rect(
+              (int)(preDamageRect.left * wFactor),
+              (int)(preDamageRect.top * hFactor),
+              (int)(preDamageRect.right * wFactor),
+              (int)(preDamageRect.bottom * hFactor));
+          Region realDamage = Region(scaledDamageRect).translate(frame.left, frame.top);
+          error = hwcLayer->setSurfaceDamage(realDamage);
+       }
+    } else {
+       error = hwcLayer->setSurfaceDamage(surfaceDamageRegion);
+    }
     if (error != HWC2::Error::None) {
         ALOGE("[%s] Failed to set surface damage: %s (%d)", mName.string(),
               to_string(error).c_str(), static_cast<int32_t>(error));
@@ -701,13 +734,19 @@ bool BufferLayer::isOpaque(const Layer::State& s) const {
 }
 
 void BufferLayer::onFirstRef() {
+    Layer::onFirstRef();
+
     // Creates a custom BufferQueue for SurfaceFlingerConsumer to use
     sp<IGraphicBufferProducer> producer;
     sp<IGraphicBufferConsumer> consumer;
     BufferQueue::createBufferQueue(&producer, &consumer, true);
     mProducer = new MonitoredProducer(producer, mFlinger, this);
-    mConsumer = new BufferLayerConsumer(consumer,
-            mFlinger->getRenderEngine(), mTextureName, this);
+    {
+        // Grab the SF state lock during this since it's the only safe way to access RenderEngine
+        Mutex::Autolock lock(mFlinger->mStateLock);
+        mConsumer = new BufferLayerConsumer(consumer, mFlinger->getRenderEngine(), mTextureName,
+                                            this);
+    }
     mConsumer->setConsumerUsageBits(getEffectiveUsage(0));
     mConsumer->setContentsChangedListener(this);
     mConsumer->setName(mName);
